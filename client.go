@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"log"
@@ -8,39 +9,48 @@ import (
 	"os"
 )
 
-func mustCopy(dst io.Writer, src io.Reader) {
-	if _, err := io.Copy(dst, src); err != nil {
-		log.Fatal(err)
-	}
-}
-
 func main() {
-	// Solicita o apelido antes de conectar ao servidor
 	var apelido string
 
 	fmt.Print("Digite seu apelido: ")
 	fmt.Scanln(&apelido)
 
-	// Estabelece conexão TCP
 	conn, err := net.Dial("tcp", "localhost:4444")
-
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer conn.Close()
 
 	fmt.Println("Connected!")
-
-	// Envia a identificação ao servidor
 	fmt.Fprintln(conn, "NICK "+apelido)
 
 	done := make(chan struct{})
 
+	// Recebe mensagens do servidor
 	go func() {
 		io.Copy(os.Stdout, conn)
-		log.Println("done")
-		done <- struct{}{} // sinaliza para a gorrotina principal
+		close(done)
 	}()
-	mustCopy(conn, os.Stdin)
-	conn.Close()
-	<-done // espera a gorrotina terminar
+
+	// Lê comandos digitados pelo usuário
+	scanner := bufio.NewScanner(os.Stdin)
+
+	for scanner.Scan() {
+		texto := scanner.Text()
+
+		if texto == `\exit` {
+			fmt.Println("Saindo do chat...")
+			break
+		}
+
+		fmt.Fprintln(conn, texto)
+	}
+
+	// Avisa ao servidor que não enviaremos mais dados.
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		tcp.CloseWrite()
+	}
+
+	// Aguarda o encerramento da leitura.
+	<-done
 }
