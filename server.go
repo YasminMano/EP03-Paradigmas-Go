@@ -24,23 +24,39 @@ type pedidoTrocaApelido struct {
 	resposta    chan bool
 }
 
+type pedidoMensagemPrivada struct {
+	remetente    *client
+	destinatario string
+	conteudo     string
+	resposta     chan bool
+}
+
 var (
-	entering      = make(chan pedidoEntrada)
-	leaving       = make(chan *client)
-	messages      = make(chan string)
-	trocasApelido = make(chan pedidoTrocaApelido)
+	entering          = make(chan pedidoEntrada)
+	leaving           = make(chan *client)
+	messages          = make(chan string)
+	trocasApelido     = make(chan pedidoTrocaApelido)
+	mensagensPrivadas = make(chan pedidoMensagemPrivada)
 )
 
 func broadcaster() {
 	clients := make(map[*client]bool)
 	apelidos := make(map[string]*client)
 
+	// Envia sem deixar um cliente lento bloquear o servidor.
+	enviar := func(cli *client, msg string) {
+		select {
+		case cli.mensagens <- msg:
+		default:
+			log.Printf("Fila de mensagens cheia para @%s", cli.apelido)
+		}
+	}
+
 	for {
 		select {
 		case msg := <-messages:
-			// Envia a mensagem para todos os clientes conectados
 			for cli := range clients {
-				cli.mensagens <- msg
+				enviar(cli, msg)
 			}
 
 		case pedido := <-entering:
@@ -53,7 +69,6 @@ func broadcaster() {
 
 			clients[cli] = true
 			apelidos[cli.apelido] = cli
-
 			pedido.resposta <- true
 
 		case cli := <-leaving:
@@ -65,25 +80,39 @@ func broadcaster() {
 			cli := pedido.usuario
 			novo := strings.TrimSpace(pedido.novoApelido)
 
-			// Verifica se o novo apelido é válido
 			if novo == "" {
 				pedido.resposta <- false
 				continue
 			}
 
-			// Impede que outro usuário utilize o mesmo apelido
 			if existente, ocupado := apelidos[novo]; ocupado && existente != cli {
 				pedido.resposta <- false
 				continue
 			}
 
-			// Guarda o apelido antigo
 			antigo := cli.apelido
-
-			// Atualiza o mapa e o usuário
 			delete(apelidos, antigo)
 			cli.apelido = novo
 			apelidos[novo] = cli
+
+			pedido.resposta <- true
+
+		case pedido := <-mensagensPrivadas:
+			destino, existe := apelidos[pedido.destinatario]
+
+			if !existe {
+				pedido.resposta <- false
+				continue
+			}
+
+			mensagem := "@" + pedido.remetente.apelido +
+				" disse em privado: " + pedido.conteudo
+
+			// Apenas o destinatário recebe a mensagem.
+			enviar(destino, mensagem)
+
+			// O servidor registra a mensagem privada.
+			fmt.Println(mensagem)
 
 			pedido.resposta <- true
 		}
@@ -99,7 +128,7 @@ func clientWriter(conn net.Conn, ch <-chan string) {
 func handleConn(conn net.Conn) {
 	defer conn.Close()
 
-	ch := make(chan string)
+	ch := make(chan string, 32)
 	go clientWriter(conn, ch)
 
 	input := bufio.NewScanner(conn)
@@ -184,7 +213,52 @@ func handleConn(conn net.Conn) {
 			continue
 		}
 
-		messages <- "@" + apelido + " disse: " + texto
+		// Comandos de mensagens públicas e privadas
+		if texto == `\msg` || strings.HasPrefix(texto, `\msg `) {
+			conteudo := strings.TrimSpace(
+				strings.TrimPrefix(texto, `\msg`),
+			)
+
+			if conteudo == "" {
+				ch <- "Erro: a mensagem não pode estar vazia."
+				continue
+			}
+
+			// Mensagem privada: \msg @Leo Olá!
+			if strings.HasPrefix(conteudo, "@") {
+				partes := strings.SplitN(conteudo, " ", 2)
+
+				if len(partes) < 2 || strings.TrimSpace(partes[1]) == "" {
+					ch <- "Erro: informe o destinatário e a mensagem."
+					continue
+				}
+
+				destinatario := strings.TrimPrefix(partes[0], "@")
+				mensagem := strings.TrimSpace(partes[1])
+
+				resposta := make(chan bool)
+
+				mensagensPrivadas <- pedidoMensagemPrivada{
+					remetente:    usuario,
+					destinatario: destinatario,
+					conteudo:     mensagem,
+					resposta:     resposta,
+				}
+
+				if !<-resposta {
+					ch <- "Erro: destinatário não encontrado."
+				}
+
+				continue
+			}
+
+			// Mensagem pública
+			messages <- "@" + apelido + " disse: " + conteudo
+			continue
+		}
+
+		// Comando não reconhecido
+		ch <- "Erro: utilize \\msg para enviar mensagens."
 	}
 
 	// Remove o usuário quando ele desconecta
