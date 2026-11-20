@@ -11,6 +11,7 @@ import (
 type client struct {
 	apelido   string
 	mensagens chan string
+	bot       bool
 }
 
 type pedidoEntrada struct {
@@ -56,9 +57,10 @@ func broadcaster() {
 		select {
 		case msg := <-messages:
 			for cli := range clients {
-				enviar(cli, msg)
+				if !cli.bot {
+					enviar(cli, msg)
+				}
 			}
-
 		case pedido := <-entering:
 			cli := pedido.usuario
 
@@ -141,15 +143,25 @@ func handleConn(conn net.Conn) {
 
 	identificacao := input.Text()
 
-	if !strings.HasPrefix(identificacao, "NICK ") {
-		fmt.Fprintln(conn, "Erro: informe seu apelido primeiro.")
+	ehBot := strings.HasPrefix(identificacao, "BOT ")
+
+	if !ehBot && !strings.HasPrefix(identificacao, "NICK ") {
+		fmt.Fprintln(conn, "Erro: identificação inválida.")
 		close(ch)
 		return
 	}
 
-	apelido := strings.TrimSpace(
-		strings.TrimPrefix(identificacao, "NICK "),
-	)
+	var apelido string
+
+	if ehBot {
+		apelido = strings.TrimSpace(
+			strings.TrimPrefix(identificacao, "BOT "),
+		)
+	} else {
+		apelido = strings.TrimSpace(
+			strings.TrimPrefix(identificacao, "NICK "),
+		)
+	}
 
 	if apelido == "" {
 		fmt.Fprintln(conn, "Erro: apelido inválido.")
@@ -161,6 +173,7 @@ func handleConn(conn net.Conn) {
 	usuario := &client{
 		apelido:   apelido,
 		mensagens: ch,
+		bot:       ehBot,
 	}
 
 	resposta := make(chan bool)
@@ -176,7 +189,12 @@ func handleConn(conn net.Conn) {
 		return
 	}
 
-	mensagemEntrada := "Usuário @" + apelido + " acabou de entrar"
+	tipo := "Usuário"
+	if usuario.bot {
+		tipo = "Bot"
+	}
+
+	mensagemEntrada := tipo + " @" + apelido + " acabou de entrar"
 
 	fmt.Println(mensagemEntrada)
 	messages <- mensagemEntrada
