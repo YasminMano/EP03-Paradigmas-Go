@@ -203,6 +203,11 @@ func handleConn(conn net.Conn) {
 	for input.Scan() {
 		texto := input.Text()
 
+		// Ignora linhas vazias.
+		if strings.TrimSpace(texto) == "" {
+			continue
+		}
+
 		if strings.HasPrefix(texto, `\changenick `) {
 			novoApelido := strings.TrimSpace(
 				strings.TrimPrefix(texto, `\changenick `),
@@ -282,7 +287,12 @@ func handleConn(conn net.Conn) {
 	// Remove o usuário quando ele desconecta
 	leaving <- usuario
 
-	mensagemSaida := "Usuário @" + apelido + " saiu"
+	tipo = "Usuário"
+	if usuario.bot {
+		tipo = "Bot"
+	}
+
+	mensagemSaida := tipo + " @" + apelido + " saiu"
 
 	fmt.Println(mensagemSaida)
 	messages <- mensagemSaida
