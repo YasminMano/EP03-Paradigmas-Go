@@ -8,28 +8,84 @@ import (
 	"strings"
 )
 
-type client chan<- string // canal de mensagem
+type client struct {
+	apelido   string
+	mensagens chan string
+}
+
+type pedidoEntrada struct {
+	usuario  *client
+	resposta chan bool
+}
+
+type pedidoTrocaApelido struct {
+	usuario     *client
+	novoApelido string
+	resposta    chan bool
+}
 
 var (
-	entering = make(chan client)
-	leaving  = make(chan client)
-	messages = make(chan string)
+	entering      = make(chan pedidoEntrada)
+	leaving       = make(chan *client)
+	messages      = make(chan string)
+	trocasApelido = make(chan pedidoTrocaApelido)
 )
 
 func broadcaster() {
-	clients := make(map[client]bool) // todos os clientes conectados
+	clients := make(map[*client]bool)
+	apelidos := make(map[string]*client)
+
 	for {
 		select {
 		case msg := <-messages:
-			// broadcast de mensagens. Envio para todos
+			// Envia a mensagem para todos os clientes conectados
 			for cli := range clients {
-				cli <- msg
+				cli.mensagens <- msg
 			}
-		case cli := <-entering:
+
+		case pedido := <-entering:
+			cli := pedido.usuario
+
+			if _, existe := apelidos[cli.apelido]; existe {
+				pedido.resposta <- false
+				continue
+			}
+
 			clients[cli] = true
+			apelidos[cli.apelido] = cli
+
+			pedido.resposta <- true
+
 		case cli := <-leaving:
 			delete(clients, cli)
-			close(cli)
+			delete(apelidos, cli.apelido)
+			close(cli.mensagens)
+
+		case pedido := <-trocasApelido:
+			cli := pedido.usuario
+			novo := strings.TrimSpace(pedido.novoApelido)
+
+			// Verifica se o novo apelido é válido
+			if novo == "" {
+				pedido.resposta <- false
+				continue
+			}
+
+			// Impede que outro usuário utilize o mesmo apelido
+			if existente, ocupado := apelidos[novo]; ocupado && existente != cli {
+				pedido.resposta <- false
+				continue
+			}
+
+			// Guarda o apelido antigo
+			antigo := cli.apelido
+
+			// Atualiza o mapa e o usuário
+			delete(apelidos, antigo)
+			cli.apelido = novo
+			apelidos[novo] = cli
+
+			pedido.resposta <- true
 		}
 	}
 }
@@ -72,21 +128,67 @@ func handleConn(conn net.Conn) {
 		return
 	}
 
-	// Registra o cliente no broadcaster
-	entering <- ch
+	// Cria e registra o cliente
+	usuario := &client{
+		apelido:   apelido,
+		mensagens: ch,
+	}
+
+	resposta := make(chan bool)
+
+	entering <- pedidoEntrada{
+		usuario:  usuario,
+		resposta: resposta,
+	}
+
+	if !<-resposta {
+		fmt.Fprintln(conn, "Erro: apelido já está em uso.")
+		close(ch)
+		return
+	}
 
 	mensagemEntrada := "Usuário @" + apelido + " acabou de entrar"
 
 	fmt.Println(mensagemEntrada)
 	messages <- mensagemEntrada
 
-	// Recebe as mensagens do usuário
+	// Recebe as mensagens e os comandos do usuário
 	for input.Scan() {
-		messages <- "@" + apelido + " disse: " + input.Text()
+		texto := input.Text()
+
+		if strings.HasPrefix(texto, `\changenick `) {
+			novoApelido := strings.TrimSpace(
+				strings.TrimPrefix(texto, `\changenick `),
+			)
+
+			resposta := make(chan bool)
+
+			trocasApelido <- pedidoTrocaApelido{
+				usuario:     usuario,
+				novoApelido: novoApelido,
+				resposta:    resposta,
+			}
+
+			if <-resposta {
+				antigo := apelido
+				apelido = novoApelido
+
+				mensagem := "Usuário @" + antigo + " agora é @" + novoApelido
+
+				fmt.Println(mensagem)
+				messages <- mensagem
+			} else {
+				ch <- "Erro: apelido inválido ou já está em uso."
+			}
+
+			continue
+		}
+
+		messages <- "@" + apelido + " disse: " + texto
 	}
 
 	// Remove o usuário quando ele desconecta
-	leaving <- ch
+	leaving <- usuario
 
 	mensagemSaida := "Usuário @" + apelido + " saiu"
 
