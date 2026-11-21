@@ -34,40 +34,58 @@ func main() {
 	}
 
 	done := make(chan struct{})
+	comandos := make(chan string)
 
-	// Recebe mensagens do servidor
+	// Recebe mensagens do servidor.
 	go func() {
-		io.Copy(os.Stdout, conn)
+		if _, err := io.Copy(os.Stdout, conn); err != nil {
+			log.Printf("Erro ao receber mensagens: %v", err)
+		}
 		close(done)
 	}()
 
-	// Lê comandos digitados pelo usuário
-	scanner := bufio.NewScanner(os.Stdin)
+	// Lê o teclado sem bloquear a rotina principal.
+	go func() {
+		defer close(comandos)
 
-	for scanner.Scan() {
-		texto := scanner.Text()
+		scanner := bufio.NewScanner(os.Stdin)
 
-		if texto == `\exit` {
-			fmt.Println("Saindo do chat...")
-			break
+		for scanner.Scan() {
+			comandos <- scanner.Text()
 		}
 
-		if _, err := fmt.Fprintln(conn, texto); err != nil {
-			log.Printf("Erro ao enviar comando: %v", err)
-			break
+		if err := scanner.Err(); err != nil {
+			log.Printf("Erro ao ler teclado: %v", err)
+		}
+	}()
+
+	// Aguarda comandos do teclado ou encerramento do servidor.
+	for {
+		select {
+		case <-done:
+			fmt.Println("Conexão com o servidor encerrada.")
+			return
+
+		case texto, aberto := <-comandos:
+			if !aberto || texto == `\exit` {
+				if texto == `\exit` {
+					fmt.Println("Saindo do chat...")
+				}
+
+				if tcp, ok := conn.(*net.TCPConn); ok {
+					if err := tcp.CloseWrite(); err != nil {
+						log.Printf("Erro ao encerrar envio: %v", err)
+					}
+				}
+
+				<-done
+				return
+			}
+
+			if _, err := fmt.Fprintln(conn, texto); err != nil {
+				log.Printf("Erro ao enviar comando: %v", err)
+				return
+			}
 		}
 	}
-
-	// Verifica se ocorreu algum erro na leitura do teclado.
-	if err := scanner.Err(); err != nil {
-		log.Printf("Erro ao ler teclado: %v", err)
-	}
-
-	// Avisa ao servidor que não enviaremos mais dados.
-	if tcp, ok := conn.(*net.TCPConn); ok {
-		tcp.CloseWrite()
-	}
-
-	// Aguarda o encerramento da leitura.
-	<-done
 }
