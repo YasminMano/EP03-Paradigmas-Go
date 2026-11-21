@@ -13,7 +13,14 @@ func main() {
 	var apelido string
 
 	fmt.Print("Digite seu apelido: ")
-	fmt.Scanln(&apelido)
+
+	if _, err := fmt.Scanln(&apelido); err != nil {
+		log.Fatalf("Erro ao ler apelido: %v", err)
+	}
+
+	if apelido == "" {
+		log.Fatal("Erro: o apelido não pode estar vazio.")
+	}
 
 	conn, err := net.Dial("tcp", "localhost:4444")
 	if err != nil {
@@ -22,7 +29,9 @@ func main() {
 	defer conn.Close()
 
 	fmt.Println("Connected!")
-	fmt.Fprintln(conn, "NICK "+apelido)
+	if _, err := fmt.Fprintln(conn, "NICK "+apelido); err != nil {
+		log.Fatalf("Erro ao enviar apelido: %v", err)
+	}
 
 	done := make(chan struct{})
 
@@ -43,7 +52,15 @@ func main() {
 			break
 		}
 
-		fmt.Fprintln(conn, texto)
+		if _, err := fmt.Fprintln(conn, texto); err != nil {
+			log.Printf("Erro ao enviar comando: %v", err)
+			break
+		}
+	}
+
+	// Verifica se ocorreu algum erro na leitura do teclado.
+	if err := scanner.Err(); err != nil {
+		log.Printf("Erro ao ler teclado: %v", err)
 	}
 
 	// Avisa ao servidor que não enviaremos mais dados.

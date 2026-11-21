@@ -29,7 +29,9 @@ func main() {
 	apelido := "Inversor"
 
 	// Identifica o programa como bot.
-	fmt.Fprintln(conn, "BOT "+apelido)
+	if _, err := fmt.Fprintln(conn, "BOT "+apelido); err != nil {
+		log.Fatalf("Erro ao identificar bot: %v", err)
+	}
 
 	fmt.Println("Bot @" + apelido + " conectado!")
 
@@ -39,11 +41,17 @@ func main() {
 		linha := scanner.Text()
 
 		partes := strings.SplitN(linha, " disse em privado: ", 2)
-		if len(partes) != 2 {
+
+		if len(partes) != 2 || !strings.HasPrefix(partes[0], "@") {
 			continue
 		}
 
 		remetente := strings.TrimPrefix(partes[0], "@")
+
+		if remetente == "" {
+			continue
+		}
+
 		recebida := partes[1]
 		resposta := inverter(recebida)
 
@@ -52,7 +60,10 @@ func main() {
 		fmt.Println("Resposta: " + resposta)
 
 		// Responde em privado.
-		fmt.Fprintf(conn, "\\msg @%s %s\n", remetente, resposta)
+		if _, err := fmt.Fprintf(conn, "\\msg @%s %s\n", remetente, resposta); err != nil {
+			log.Printf("Erro ao responder para @%s: %v", remetente, err)
+			break
+		}
 	}
 
 	if err := scanner.Err(); err != nil {

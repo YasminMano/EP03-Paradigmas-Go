@@ -6,12 +6,23 @@ import (
 	"log"
 	"net"
 	"strings"
+	"time"
 )
 
 type client struct {
-	apelido   string
-	mensagens chan string
-	bot       bool
+	apelido    string
+	mensagens  chan string
+	bot        bool
+	writerDone <-chan struct{}
+}
+
+// Valida apelidos utilizados no protocolo do chat.
+func apelidoValido(apelido string) bool {
+	if apelido == "" || strings.ContainsAny(apelido, " \t\r\n@") {
+		return false
+	}
+
+	return true
 }
 
 type pedidoEntrada struct {
@@ -32,9 +43,14 @@ type pedidoMensagemPrivada struct {
 	resposta     chan bool
 }
 
+type pedidoSaida struct {
+	usuario  *client
+	resposta chan struct{}
+}
+
 var (
 	entering          = make(chan pedidoEntrada)
-	leaving           = make(chan *client)
+	leaving           = make(chan pedidoSaida)
 	messages          = make(chan string)
 	trocasApelido     = make(chan pedidoTrocaApelido)
 	mensagensPrivadas = make(chan pedidoMensagemPrivada)
@@ -44,12 +60,23 @@ func broadcaster() {
 	clients := make(map[*client]bool)
 	apelidos := make(map[string]*client)
 
-	// Envia sem deixar um cliente lento bloquear o servidor.
-	enviar := func(cli *client, msg string) {
+	// Tenta colocar a mensagem na fila do destinatário.
+	// Retorna false quando a fila está cheia.
+	enviar := func(cli *client, msg string) bool {
+		select {
+		case <-cli.writerDone:
+			return false
+		default:
+		}
+
 		select {
 		case cli.mensagens <- msg:
+			return true
+		case <-cli.writerDone:
+			return false
 		default:
 			log.Printf("Fila de mensagens cheia para @%s", cli.apelido)
+			return false
 		}
 	}
 
@@ -73,16 +100,22 @@ func broadcaster() {
 			apelidos[cli.apelido] = cli
 			pedido.resposta <- true
 
-		case cli := <-leaving:
-			delete(clients, cli)
-			delete(apelidos, cli.apelido)
-			close(cli.mensagens)
+		case pedido := <-leaving:
+			cli := pedido.usuario
+
+			if clients[cli] {
+				delete(clients, cli)
+				delete(apelidos, cli.apelido)
+				close(cli.mensagens)
+			}
+
+			close(pedido.resposta)
 
 		case pedido := <-trocasApelido:
 			cli := pedido.usuario
 			novo := strings.TrimSpace(pedido.novoApelido)
 
-			if novo == "" {
+			if !apelidoValido(novo) {
 				pedido.resposta <- false
 				continue
 			}
@@ -111,7 +144,10 @@ func broadcaster() {
 				" disse em privado: " + pedido.conteudo
 
 			// Apenas o destinatário recebe a mensagem.
-			enviar(destino, mensagem)
+			if !enviar(destino, mensagem) {
+				pedido.resposta <- false
+				continue
+			}
 
 			// O servidor registra a mensagem privada.
 			fmt.Println(mensagem)
@@ -121,17 +157,48 @@ func broadcaster() {
 	}
 }
 
-func clientWriter(conn net.Conn, ch <-chan string) {
+func clientWriter(conn net.Conn, ch <-chan string, done chan<- struct{}) {
+	defer close(done)
+
 	for msg := range ch {
-		fmt.Fprintln(conn, msg)
+		if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			log.Printf("Erro ao definir prazo de escrita: %v", err)
+			conn.Close()
+			return
+		}
+
+		if _, err := fmt.Fprintln(conn, msg); err != nil {
+			log.Printf("Erro ao enviar mensagem: %v", err)
+			conn.Close()
+			return
+		}
+	}
+}
+
+// Envia uma resposta ao cliente sem bloquear caso o escritor termine.
+func responder(ch chan<- string, done <-chan struct{}, mensagem string) {
+	select {
+	case <-done:
+		return
+	default:
+	}
+
+	select {
+	case ch <- mensagem:
+	case <-done:
 	}
 }
 
 func handleConn(conn net.Conn) {
-	defer conn.Close()
-
 	ch := make(chan string, 32)
-	go clientWriter(conn, ch)
+	writerDone := make(chan struct{})
+
+	go clientWriter(conn, ch, writerDone)
+
+	defer func() {
+		<-writerDone
+		conn.Close()
+	}()
 
 	input := bufio.NewScanner(conn)
 
@@ -146,7 +213,7 @@ func handleConn(conn net.Conn) {
 	ehBot := strings.HasPrefix(identificacao, "BOT ")
 
 	if !ehBot && !strings.HasPrefix(identificacao, "NICK ") {
-		fmt.Fprintln(conn, "Erro: identificação inválida.")
+		responder(ch, writerDone, "Erro: identificação inválida.")
 		close(ch)
 		return
 	}
@@ -163,17 +230,18 @@ func handleConn(conn net.Conn) {
 		)
 	}
 
-	if apelido == "" {
-		fmt.Fprintln(conn, "Erro: apelido inválido.")
+	if !apelidoValido(apelido) {
+		responder(ch, writerDone, "Erro: apelido inválido.")
 		close(ch)
 		return
 	}
 
 	// Cria e registra o cliente
 	usuario := &client{
-		apelido:   apelido,
-		mensagens: ch,
-		bot:       ehBot,
+		apelido:    apelido,
+		mensagens:  ch,
+		bot:        ehBot,
+		writerDone: writerDone,
 	}
 
 	resposta := make(chan bool)
@@ -184,7 +252,7 @@ func handleConn(conn net.Conn) {
 	}
 
 	if !<-resposta {
-		fmt.Fprintln(conn, "Erro: apelido já está em uso.")
+		responder(ch, writerDone, "Erro: apelido já está em uso.")
 		close(ch)
 		return
 	}
@@ -230,7 +298,7 @@ func handleConn(conn net.Conn) {
 				fmt.Println(mensagem)
 				messages <- mensagem
 			} else {
-				ch <- "Erro: apelido inválido ou já está em uso."
+				responder(ch, writerDone, "Erro: apelido inválido ou já está em uso.")
 			}
 
 			continue
@@ -243,7 +311,7 @@ func handleConn(conn net.Conn) {
 			)
 
 			if conteudo == "" {
-				ch <- "Erro: a mensagem não pode estar vazia."
+				responder(ch, writerDone, "Erro: a mensagem não pode estar vazia.")
 				continue
 			}
 
@@ -252,7 +320,7 @@ func handleConn(conn net.Conn) {
 				partes := strings.SplitN(conteudo, " ", 2)
 
 				if len(partes) < 2 || strings.TrimSpace(partes[1]) == "" {
-					ch <- "Erro: informe o destinatário e a mensagem."
+					responder(ch, writerDone, "Erro: informe o destinatário e a mensagem.")
 					continue
 				}
 
@@ -269,7 +337,7 @@ func handleConn(conn net.Conn) {
 				}
 
 				if !<-resposta {
-					ch <- "Erro: destinatário não encontrado."
+					responder(ch, writerDone, "Erro: destinatário não encontrado ou indisponível.")
 				}
 
 				continue
@@ -281,11 +349,22 @@ func handleConn(conn net.Conn) {
 		}
 
 		// Comando não reconhecido
-		ch <- "Erro: utilize \\msg para enviar mensagens."
+		responder(ch, writerDone, "Erro: utilize \\msg para enviar mensagens.")
 	}
 
-	// Remove o usuário quando ele desconecta
-	leaving <- usuario
+	if err := input.Err(); err != nil {
+		log.Printf("Erro ao ler dados de @%s: %v", apelido, err)
+	}
+
+	// Solicita a remoção e aguarda o fechamento da fila.
+	saidaConfirmada := make(chan struct{})
+
+	leaving <- pedidoSaida{
+		usuario:  usuario,
+		resposta: saidaConfirmada,
+	}
+
+	<-saidaConfirmada
 
 	tipo = "Usuário"
 	if usuario.bot {
@@ -301,10 +380,12 @@ func handleConn(conn net.Conn) {
 func main() {
 	fmt.Println("Iniciando servidor...")
 	listener, err := net.Listen("tcp", "0.0.0.0:4444")
-	fmt.Println("Portas abertas!")
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer listener.Close()
+
+	fmt.Println("Portas abertas!")
 	go broadcaster()
 	for {
 		conn, err := listener.Accept()
